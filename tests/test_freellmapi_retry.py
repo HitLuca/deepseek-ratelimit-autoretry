@@ -1,13 +1,14 @@
 import contextlib
 import http.client
 import io
-import json
 import socket
 import struct
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from unittest import mock
 
 import freellmapi_retry as fr
 
@@ -108,7 +109,9 @@ class ProxyTestCase(unittest.TestCase):
         return server
 
     def start_stub(self, recorder, stream=False):
-        server = start(ThreadingHTTPServer(("127.0.0.1", 0), make_stub(recorder, stream)))
+        server = start(
+            ThreadingHTTPServer(("127.0.0.1", 0), make_stub(recorder, stream))
+        )
         self.servers.append(server)
         return server
 
@@ -128,7 +131,7 @@ class ProxyTestCase(unittest.TestCase):
 
 class ParsingTests(unittest.TestCase):
     def test_wants_stream_from_body_and_accept(self):
-        handler = object.__new__(fr.ProxyHandler)
+        handler: Any = object.__new__(fr.ProxyHandler)
         for accept, body, expected in (
             (None, b'{"stream":true}', True),
             (None, b'{"stream": false}', False),
@@ -139,14 +142,29 @@ class ParsingTests(unittest.TestCase):
         ):
             handler.headers = {"Accept": accept} if accept else {}
             self.assertEqual(
-                handler._wants_stream(body), expected, (accept, body)
+                handler._wants_stream(body),  # pylint: disable=protected-access
+                expected,
+                (accept, body),
             )
 
     def test_cooldown_parsed_from_body(self):
         self.assertEqual(fr.parse_cooldown(EXHAUSTED, 90), 1)
 
+    def test_cooldown_parses_units(self):
+        for token, expected in [
+            (b"~90s", 90),
+            (b"~4m", 240),
+            (b"~1m30s", 90),
+            (b"~2m 15s", 135),
+            (b"~1.5s", 2),
+            (b"~0s", 0),
+        ]:
+            body = b"All models exhausted. Soonest reset " + token + b"."
+            self.assertEqual(fr.parse_cooldown(body, 90), expected, token)
+
     def test_cooldown_falls_back_when_absent(self):
         self.assertEqual(fr.parse_cooldown(b"429 slow down", 90), 90)
+        self.assertEqual(fr.parse_cooldown(b"soonest reset ~", 90), 90)
 
     def test_marker_detection(self):
         self.assertTrue(fr.is_retryable_429(EXHAUSTED))
@@ -157,6 +175,38 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual((up.scheme, up.host, up.port), ("http", "127.0.0.1", 31415))
         with self.assertRaises(ValueError):
             fr.parse_upstream("ftp://example.com")
+
+
+class NotificationTests(unittest.TestCase):
+    def test_skipped_off_macos(self):
+        with (
+            mock.patch.object(fr.sys, "platform", "linux"),
+            mock.patch.object(fr.subprocess, "Popen") as popen,
+        ):
+            fr.notify_rate_limited(91, 1, 10)
+        popen.assert_not_called()
+
+    def test_invokes_osascript_on_macos(self):
+        with (
+            mock.patch.object(fr.sys, "platform", "darwin"),
+            mock.patch.object(fr.subprocess, "Popen") as popen,
+        ):
+            fr.notify_rate_limited(91, 1, 10)
+
+        cmd = popen.call_args.args[0]
+        self.assertEqual(cmd[0], "osascript")
+        self.assertIn("display notification", cmd[2])
+        self.assertEqual(cmd[3], fr.NOTIFY_TITLE)
+        self.assertIn("retry 1/10 in 91s", cmd[4])
+
+    def test_missing_osascript_is_swallowed(self):
+        with (
+            mock.patch.object(fr.sys, "platform", "darwin"),
+            mock.patch.object(
+                fr.subprocess, "Popen", side_effect=OSError("no osascript")
+            ),
+        ):
+            fr.notify_rate_limited(91, 1, 10)
 
 
 class ServerErrorTests(unittest.TestCase):
@@ -201,7 +251,10 @@ class ProxyBehaviourTests(ProxyTestCase):
             proxy,
             body=b'{"model":"deepseek"}',
             path="/v1/messages?beta=1",
-            headers={"Authorization": "Bearer sk-test", "anthropic-version": "2023-06-01"},
+            headers={
+                "Authorization": "Bearer sk-test",
+                "anthropic-version": "2023-06-01",
+            },
         )
 
         self.assertEqual(status, 200)
@@ -278,6 +331,28 @@ class ProxyBehaviourTests(ProxyTestCase):
         self.assertIn(b"event: error", body)
         self.assertIn(b"All models exhausted", body)
 
+    def test_notifies_once_on_first_retryable_429(self):
+        recorder = Recorder([(429, EXHAUSTED)])
+        stub = self.start_stub(recorder)
+        proxy = self.start_proxy(stub, max_retries=2, notify=True)
+
+        with mock.patch.object(fr, "notify_rate_limited") as notify:
+            status, _, _ = self.do_request(proxy)
+
+        self.assertEqual(status, 429)
+        notify.assert_called_once_with(1, 1, 2)
+
+    def test_notifications_are_off_by_default(self):
+        recorder = Recorder([(429, EXHAUSTED), (200, b'{"ok":true}')])
+        stub = self.start_stub(recorder)
+        proxy = self.start_proxy(stub)
+
+        with mock.patch.object(fr, "notify_rate_limited") as notify:
+            status, _, _ = self.do_request(proxy)
+
+        self.assertEqual(status, 200)
+        notify.assert_not_called()
+
     def test_non_streaming_client_gets_no_keepalive(self):
         recorder = Recorder([(429, EXHAUSTED), (200, b'{"ok":true}')])
         stub = self.start_stub(recorder)
@@ -318,9 +393,7 @@ class ProxyBehaviourTests(ProxyTestCase):
         dead_port = probe.getsockname()[1]
         probe.close()
 
-        cfg = fr.Config(
-            upstream=fr.Upstream("http", "127.0.0.1", dead_port), port=0
-        )
+        cfg = fr.Config(upstream=fr.Upstream("http", "127.0.0.1", dead_port), port=0)
         proxy = start(fr.make_server(cfg))
         self.servers.append(proxy)
 
@@ -352,7 +425,9 @@ class ProxyBehaviourTests(ProxyTestCase):
         stub = self.start_stub(recorder)
         proxy = self.start_proxy(stub)
 
-        sock = socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=10)
+        sock = socket.create_connection(
+            ("127.0.0.1", proxy.server_address[1]), timeout=10
+        )
         try:
             sock.sendall(
                 b"POST /v1/messages HTTP/1.1\r\n"

@@ -20,10 +20,12 @@ import argparse
 import http.client
 import json
 import logging
+import math
 import os
 import re
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -42,7 +44,10 @@ UPSTREAM_TIMEOUT = 600.0
 RETRY_EXTRA_WAIT = 2
 
 EXHAUSTED_MARKER = b"all models exhausted"
-RESET_RE = re.compile(rb"soonest reset ~(\d+)s", re.IGNORECASE)
+RESET_RE = re.compile(
+    rb"soonest reset ~((?:\d+m\s*)?(?:\d+(?:\.\d+)?s)?)", re.IGNORECASE
+)
+DURATION_RE = re.compile(rb"(\d+)m|(\d+(?:\.\d+)?)s", re.IGNORECASE)
 
 # RFC 7230 hop-by-hop headers, plus Expect: we consume the request body
 # ourselves, and forwarding Expect: 100-continue would make http.client hand us
@@ -88,6 +93,7 @@ class Config:
     max_retries: int = DEFAULT_MAX_RETRIES
     default_cooldown: int = DEFAULT_COOLDOWN
     keepalive_interval: float = DEFAULT_KEEPALIVE
+    notify: bool = False
 
 
 def parse_upstream(url):
@@ -102,14 +108,54 @@ def parse_upstream(url):
 
 def parse_cooldown(body, default):
     match = RESET_RE.search(body)
-    return int(match.group(1)) if match else default
+    if not match or not match.group(1):
+        return default
+    total = 0
+    for minutes, seconds in DURATION_RE.findall(match.group(1)):
+        total += int(minutes) * 60 if minutes else 0
+        total += math.ceil(float(seconds)) if seconds else 0
+    return total
 
 
 def is_retryable_429(body):
     return EXHAUSTED_MARKER in body.lower()
 
 
+NOTIFY_TITLE = "FreeLLMAPI rate limited"
+
+
+def notify_rate_limited(wait, attempt, max_retries):
+    """Pop a macOS notification about a rate-limit retry.
+
+    Best-effort: fire and forget so a slow or missing osascript never delays
+    the retry. Title and message travel as separate argv entries, so neither
+    is ever interpolated into the AppleScript source.
+    """
+    if sys.platform != "darwin":
+        return
+    message = "All models exhausted; retry %d/%d in %ds" % (
+        attempt,
+        max_retries,
+        wait,
+    )
+    script = (
+        "on run argv\n"
+        "display notification (item 2 of argv) with title (item 1 of argv)\n"
+        "end run"
+    )
+    try:
+        # Fire and forget: the child is never waited on, by design.
+        subprocess.Popen(  # pylint: disable=consider-using-with
+            ["osascript", "-e", script, NOTIFY_TITLE, message],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        log.debug("could not show rate-limit notification: %s", exc)
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
+    server: "ProxyServer"
     protocol_version = "HTTP/1.1"
     server_version = "freellmapi-retry/" + __version__
     sys_version = ""
@@ -177,6 +223,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                 cfg.max_retries,
                                 wait,
                             )
+                            if attempt == 1 and cfg.notify:
+                                notify_rate_limited(wait, attempt, cfg.max_retries)
                             if can_hold_stream and wait > 0:
                                 self._hold_stream(wait, attempt, cfg)
                             else:
@@ -306,15 +354,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._stream_fixed(resp, resp.length)
 
     def _finish(self, resp, preloaded=None):
-        """Deliver a terminal upstream response, into our own stream if we opened one."""
+        """Deliver a terminal response, into our own stream if we opened one."""
         if not self._stream_committed:
             self._relay(resp, preloaded=preloaded)
             return
         if resp.status >= 400:
             body = preloaded if preloaded is not None else resp.read()
+            detail = body.decode("utf-8", "replace").strip()
             self._send_stream_error(
-                "upstream returned %d %s: %s"
-                % (resp.status, resp.reason or "", body.decode("utf-8", "replace").strip())
+                "upstream returned %d %s: %s" % (resp.status, resp.reason or "", detail)
             )
             return
         self._relay_stream_body(resp, preloaded)
@@ -474,7 +522,7 @@ CLIENT_GONE_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedEr
 
 class ProxyServer(ThreadingHTTPServer):
     daemon_threads = True
-    cfg = None
+    cfg: Config
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
@@ -641,6 +689,18 @@ def _env_float(name, fallback):
     return _env_number(name, fallback, float, "a number")
 
 
+def _env_bool(name, fallback):
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return fallback
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise SystemExit("%s must be a boolean, got %r" % (name, raw))
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="freellmapi-retry",
@@ -684,6 +744,15 @@ def build_parser():
         ),
     )
     parser.add_argument(
+        "--notify",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("RETRY_PROXY_NOTIFY", True),
+        help=(
+            "show a macOS notification when a 429 triggers a retry; no-op on "
+            "other platforms (default: %(default)s; env RETRY_PROXY_NOTIFY)"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default=os.environ.get("RETRY_PROXY_LOG_LEVEL", "info"),
         choices=("debug", "info", "warning", "error"),
@@ -719,6 +788,7 @@ def main(argv=None):
             max_retries=args.max_retries,
             default_cooldown=args.default_cooldown,
             keepalive_interval=args.keepalive,
+            notify=args.notify,
         )
     )
     return 0

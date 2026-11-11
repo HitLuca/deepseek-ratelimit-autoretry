@@ -1,0 +1,11 @@
+# Lint staged Python changes before they land. Tests belong in CI: the suite
+# sleeps through real cooldowns and would add ~30s to every commit.
+repos:
+  - repo: local
+    hooks:
+      - id: check
+        name: mypy + pylint
+        entry: ./scripts/check.sh
+        language: system
+        files: '\.py$'
+        pass_filenames: false
